@@ -4,6 +4,8 @@
 
 `skill/` is the source of truth for the Impeccable skill: `SKILL.src.md`, `reference/`, `scripts/`, and `agents/`. Build logic lives in `scripts/`, with provider configs in `scripts/lib/transformers/`. The CLI and anti-pattern detector live in `cli/`, the browser extension in `extension/`, the Astro website in `site/`, Cloudflare Pages Functions in `functions/`, and regression coverage in `tests/` with fixtures under `tests/fixtures/`. `dist/` and `build/` are generated and gitignored. The root harness folders (`.agents/`, `.claude/`, `.cursor/`, etc.) and `plugin/` are generated distribution artifacts that are tracked for direct repo installs, not hand-authored source.
 
+If you need to confirm whether your checkout is a fork or the canonical repo, trust `git remote get-url origin` (or `git remote -v`), not `package.json` metadata. The package manifest can still point at the upstream release repo even when your working clone is a fork.
+
 ## Build, Test, and Development Commands
 
 - `bun run dev` - start the local Bun server.

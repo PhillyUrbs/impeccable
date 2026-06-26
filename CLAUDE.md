@@ -12,6 +12,8 @@ There is **one** user-invocable skill, `impeccable`, with **23 commands** undern
 
 **Do not add standalone skills** unless there's a strong reason. The consolidation was deliberate: the `/` menu pollution problem is real and gets worse as users install more plugins.
 
+If you need to confirm whether your checkout is a fork or the canonical repo, trust `git remote get-url origin` (or `git remote -v`), not `package.json` metadata. The package manifest can still point at the upstream release repo even when your working clone is a fork.
+
 ### Register (brand vs product)
 
 Every design task belongs to one of two registers:
