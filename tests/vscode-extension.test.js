@@ -258,3 +258,112 @@ describe('VS Code extension install command (installSkill helper)', () => {
     }
   });
 });
+
+describe('VS Code extension Phase 2 — diagnostics (dist/vscode/)', () => {
+  test('detector.js exists and is non-empty', () => {
+    const detPath = path.join(VSCODE_DIST, 'detector.js');
+    expect(fs.existsSync(detPath)).toBe(true);
+    const content = fs.readFileSync(detPath, 'utf-8');
+    expect(content.length).toBeGreaterThan(0);
+  });
+
+  test('bundled detector exports detectForEditor and readDetectionConfig', () => {
+    const det = require(path.join(VSCODE_DIST, 'detector.js'));
+    expect(typeof det.detectForEditor).toBe('function');
+    expect(typeof det.readDetectionConfig).toBe('function');
+  });
+
+  test('bundled detectForEditor flags a known anti-pattern', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter, sans-serif;">Hello</p>',
+      languageId: 'html',
+    });
+    const ids = results.map(r => r.ruleId);
+    expect(ids).toContain('overused-font');
+  });
+
+  test('bundled detectForEditor returns non-zero line for a line-level finding', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter, sans-serif;">Hello</p>',
+      languageId: 'html',
+    });
+    const f = results.find(r => r.ruleId === 'overused-font');
+    expect(f).toBeDefined();
+    expect(f.line).toBeGreaterThan(0);
+  });
+
+  test('bundled detectForEditor returns empty array for unsupported languageId', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter">hello</p>',
+      languageId: 'python',
+    });
+    expect(results).toEqual([]);
+  });
+
+  test('bundled detectForEditor respects config.ignoreRules', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter, sans-serif;">Hello</p>',
+      languageId: 'html',
+      config: { ignoreRules: ['overused-font'] },
+    });
+    expect(results.map(r => r.ruleId)).not.toContain('overused-font');
+  });
+
+  test('bundled detectForEditor respects vsCodeSeverity "off"', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter, sans-serif;">Hello</p>',
+      languageId: 'html',
+      vsCodeSeverity: { 'overused-font': 'off' },
+    });
+    expect(results.map(r => r.ruleId)).not.toContain('overused-font');
+  });
+
+  test('bundled detectForEditor maps vsCodeSeverity "error" to severity "error"', () => {
+    const { detectForEditor } = require(path.join(VSCODE_DIST, 'detector.js'));
+    const results = detectForEditor({
+      text: '<p style="font-family: Inter, sans-serif;">Hello</p>',
+      languageId: 'html',
+      vsCodeSeverity: { 'overused-font': 'error' },
+    });
+    const f = results.find(r => r.ruleId === 'overused-font');
+    expect(f).toBeDefined();
+    expect(f.severity).toBe('error');
+  });
+
+  test('package.json has impeccable.detector.enable configuration property', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(VSCODE_DIST, 'package.json'), 'utf-8'));
+    const props = pkg.contributes?.configuration?.properties ?? {};
+    expect(props['impeccable.detector.enable']).toBeDefined();
+    expect(props['impeccable.detector.enable'].type).toBe('boolean');
+    expect(props['impeccable.detector.enable'].default).toBe(true);
+  });
+
+  test('package.json has impeccable.detector.severity configuration property', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(VSCODE_DIST, 'package.json'), 'utf-8'));
+    const props = pkg.contributes?.configuration?.properties ?? {};
+    expect(props['impeccable.detector.severity']).toBeDefined();
+    expect(props['impeccable.detector.severity'].type).toBe('object');
+  });
+
+  test('extension.js uses DiagnosticCollection named impeccable', () => {
+    const content = fs.readFileSync(path.join(VSCODE_DIST, 'extension.js'), 'utf-8');
+    expect(content).toContain("createDiagnosticCollection('impeccable')");
+  });
+
+  test('extension.js registers onDidSaveTextDocument, onDidOpenTextDocument, and onDidCloseTextDocument handlers', () => {
+    const content = fs.readFileSync(path.join(VSCODE_DIST, 'extension.js'), 'utf-8');
+    expect(content).toContain('onDidSaveTextDocument');
+    expect(content).toContain('onDidOpenTextDocument');
+    expect(content).toContain('onDidCloseTextDocument');
+  });
+
+  test('extension.js requires ./detector (the bundled self-contained module)', () => {
+    const content = fs.readFileSync(path.join(VSCODE_DIST, 'extension.js'), 'utf-8');
+    expect(content).toContain("require('./detector')");
+  });
+});

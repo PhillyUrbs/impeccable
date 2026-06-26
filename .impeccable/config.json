@@ -4,6 +4,8 @@
     "ignoreFiles": [
       "tests/fixtures/**",
       "tests/detect-antipatterns.test.js",
+      "tests/vscode-detector.test.js",
+      "tests/vscode-extension.test.js",
       "site/pages/slop/**",
       "site/data/anti-patterns-catalog.js",
       "site/pages/shader-lab/**",

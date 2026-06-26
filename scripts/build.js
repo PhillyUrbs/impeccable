@@ -18,6 +18,7 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { build as esbuild } from 'esbuild';
 import { readSourceFiles, readPatterns, stashPerProjectArtifacts, restorePerProjectArtifacts } from './lib/utils.js';
 import { generateApiData } from './lib/api-data.js';
 import { createTransformer, PROVIDERS } from './lib/transformers/index.js';
@@ -495,7 +496,7 @@ const BUILD_OPTIONS = parseBuildOptions();
  * Materializing the full tree (not just SKILL.md) is required because the
  * skill references node scripts and reference/*.md siblings by relative path.
  */
-function buildVSCodeExtension(distDir, rootDir, skills, skillsVersion) {
+async function buildVSCodeExtension(distDir, rootDir, skills, skillsVersion) {
   const vscodeDir = path.join(distDir, 'vscode');
 
   const impeccableSkill = skills.find(s => s.name === 'impeccable');
@@ -525,6 +526,25 @@ function buildVSCodeExtension(distDir, rootDir, skills, skillsVersion) {
           title: 'Impeccable: Install Skill to Workspace',
         },
       ],
+      configuration: {
+        title: 'Impeccable',
+        properties: {
+          'impeccable.detector.enable': {
+            type: 'boolean',
+            default: true,
+            description: 'Enable the Impeccable anti-pattern detector. When false, no diagnostics are shown.',
+          },
+          'impeccable.detector.severity': {
+            type: 'object',
+            default: {},
+            description: 'Per-rule severity overrides. Map a rule ID (e.g. "overused-font") to "error", "warning", "information", "hint", or "off". "off" suppresses that rule\'s diagnostics without touching the project .impeccable/config.json.',
+            additionalProperties: {
+              type: 'string',
+              enum: ['error', 'warning', 'information', 'hint', 'off'],
+            },
+          },
+        },
+      },
     },
   };
   fs.writeFileSync(
@@ -541,33 +561,171 @@ function buildVSCodeExtension(distDir, rootDir, skills, skillsVersion) {
     copyDirSync(skillsSrc, skillsDest);
   }
 
-  // extension.js — minimal CommonJS activation entrypoint
-  // API choice documented in the JSDoc above this function.
+  // Bundle the detector adapter (ESM) into a self-contained CJS module so
+  // the packaged VSIX needs no separate npm install. The adapter lives at
+  // cli/vscode-detector.mjs and imports detectText + impeccable-config.
+  // esbuild resolves and inlines all dependencies (including htmlparser2 etc.)
+  // into a single CommonJS file the extension can require('./detector').
+  await esbuild({
+    entryPoints: [path.join(rootDir, 'cli', 'vscode-detector.mjs')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    outfile: path.join(vscodeDir, 'detector.js'),
+    external: [],
+    logLevel: 'warning',
+    // Inline source map is not needed for the extension bundle
+    sourcemap: false,
+    // Target Node 18+ (VS Code 1.95 ships Electron with Node 18.x)
+    target: 'node18',
+  });
+
+  // extension.js — CommonJS activation entrypoint (Phase 1 + Phase 2)
   const extensionJs = `// SPDX-License-Identifier: Apache-2.0
-// Impeccable VS Code Extension — Phase 1 (skill delivery)
+// Impeccable VS Code Extension — Phase 1 (skill delivery) + Phase 2 (diagnostics)
 //
-// API choice: VS Code does not expose a first-class API for an extension to
-// register a chat skill that Copilot Chat consumes directly. The convention
-// Copilot Chat honors is .github/copilot-instructions.md. On invoking the
-// install command we materialize the bundled skill tree (SKILL.md + reference/
-// + scripts/) into the workspace at .github/skills/impeccable/ and write the
-// SKILL.md content into a managed block in .github/copilot-instructions.md so
-// Copilot Chat picks it up automatically. The full tree (not just SKILL.md) is
-// required because the skill text references node scripts and reference/*.md
-// siblings by paths that are only valid once those files exist on disk.
+// Phase 1: On "Impeccable: Install Skill to Workspace" command, materialise
+// the bundled skill tree (SKILL.md + reference/ + scripts/) into the workspace
+// at .github/skills/impeccable/ and write the SKILL.md into a managed block in
+// .github/copilot-instructions.md so GitHub Copilot Chat picks it up.
 //
-// All file I/O uses fs.promises so the extension host event loop is never
-// blocked. The copilot-instructions.md write preserves any pre-existing
-// user-authored content: the skill is wrapped in IMPECCABLE markers and only
-// that managed block is replaced on re-install.
+// Phase 2: Register a vscode.DiagnosticCollection named "impeccable" and run
+// the anti-pattern detector against supported documents (html, css, jsx/tsx,
+// vue, svelte, astro) on open, save, and at activation. Findings are mapped to
+// Diagnostics with a precise Range (snippet lookup on the correct line) and
+// configurable severity via impeccable.detector.severity VS Code settings.
+// Project-level ignores (.impeccable/config.json) are honored automatically
+// by routing through the same filterDetectionFindings used by the CLI.
 
 'use strict';
 
 const path = require('path');
 const fsp = require('fs').promises;
 
+// Bundled self-contained detector (ESM sources compiled to CJS by esbuild).
+const { detectForEditor, readDetectionConfig } = require('./detector');
+
 const IMPECCABLE_BEGIN = '<!-- IMPECCABLE:BEGIN (managed by the Impeccable VS Code extension; edits inside this block are overwritten on re-install) -->';
 const IMPECCABLE_END = '<!-- IMPECCABLE:END -->';
+
+// ---------------------------------------------------------------------------
+// Diagnostics helpers
+// ---------------------------------------------------------------------------
+
+/** Debounce timers keyed by document URI string. */
+const _pending = new Map();
+
+/**
+ * Debounce a per-document analysis. Cancels any in-flight timer for the same
+ * document so rapid saves / edits don't pile up work.
+ */
+function scheduleDiagnose(fn, uriString, delay) {
+  if (_pending.has(uriString)) clearTimeout(_pending.get(uriString));
+  _pending.set(uriString, setTimeout(() => {
+    _pending.delete(uriString);
+    fn();
+  }, delay));
+}
+
+const DOCS_RULES_URL = 'https://impeccable.design/anti-patterns';
+
+/**
+ * Map a single detector finding to a vscode.Diagnostic.
+ *
+ * Range strategy (never falls back to the whole file):
+ *   1. If finding.line > 0: search for snippet in that line; use column range
+ *      if found, else highlight the whole line.
+ *   2. If finding.line === 0 (page-level): search whole document text for the
+ *      first occurrence of snippet; use that position if found, else line 0.
+ */
+function findingToRange(vscode, document, finding) {
+  const { line, snippet } = finding;
+  if (line > 0) {
+    const lineIdx = line - 1; // 1-based → 0-based
+    if (lineIdx < document.lineCount) {
+      const lineText = document.lineAt(lineIdx).text;
+      if (snippet) {
+        const col = lineText.indexOf(snippet);
+        if (col >= 0) {
+          return new vscode.Range(lineIdx, col, lineIdx, col + snippet.length);
+        }
+      }
+      return document.lineAt(lineIdx).range;
+    }
+  }
+  // Page-level finding: search whole document text
+  if (snippet) {
+    const text = document.getText();
+    const idx = text.indexOf(snippet);
+    if (idx >= 0) {
+      const start = document.positionAt(idx);
+      const end = document.positionAt(idx + snippet.length);
+      return new vscode.Range(start, end);
+    }
+  }
+  return new vscode.Range(0, 0, 0, 0);
+}
+
+/** Convert our severity string to vscode.DiagnosticSeverity. */
+function toVscodeSeverity(vscode, severity) {
+  switch (severity) {
+    case 'error':       return vscode.DiagnosticSeverity.Error;
+    case 'information': return vscode.DiagnosticSeverity.Information;
+    case 'hint':        return vscode.DiagnosticSeverity.Hint;
+    default:            return vscode.DiagnosticSeverity.Warning;
+  }
+}
+
+/**
+ * Run the detector against a document and update the collection.
+ * Reads VS Code settings + project config on every call so changes take effect
+ * without reloading the extension.
+ */
+function diagnoseDocument(vscode, collection, document) {
+  const config = vscode.workspace.getConfiguration('impeccable');
+  if (!config.get('detector.enable', true)) {
+    collection.delete(document.uri);
+    return;
+  }
+
+  const vsCodeSeverity = config.get('detector.severity', {});
+
+  // Load project .impeccable/config.json if a workspace is open.
+  let projectConfig = { ignoreRules: [], ignoreFiles: [], ignoreValues: [] };
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders && folders.length > 0) {
+    try {
+      projectConfig = readDetectionConfig(folders[0].uri.fsPath);
+    } catch {
+      // No config file, or unreadable — proceed with empty config.
+    }
+  }
+
+  const findings = detectForEditor({
+    text: document.getText(),
+    languageId: document.languageId,
+    config: projectConfig,
+    vsCodeSeverity,
+  });
+
+  const diagnostics = findings.map(f => {
+    const range = findingToRange(vscode, document, f);
+    const d = new vscode.Diagnostic(
+      range,
+      f.message,
+      toVscodeSeverity(vscode, f.severity),
+    );
+    d.source = 'impeccable';
+    d.code = { value: f.ruleId, target: vscode.Uri.parse(DOCS_RULES_URL) };
+    return d;
+  });
+
+  collection.set(document.uri, diagnostics);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: skill install helpers
+// ---------------------------------------------------------------------------
 
 async function copyDir(src, dest) {
   await fsp.mkdir(dest, { recursive: true });
@@ -646,8 +804,43 @@ async function installSkill(extensionPath, workspaceRoot) {
   await fsp.writeFile(instructionsPath, mergeInstructions(existing, skillContent));
 }
 
+// ---------------------------------------------------------------------------
+// Activation
+// ---------------------------------------------------------------------------
+
 function activate(context) {
   const vscode = require('vscode');
+
+  // Phase 2: diagnostic collection
+  const collection = vscode.languages.createDiagnosticCollection('impeccable');
+  context.subscriptions.push(collection);
+
+  const DEBOUNCE_MS = 300;
+
+  // Scan a document (debounced so rapid saves don't thrash).
+  function scheduleScan(document) {
+    scheduleDiagnose(
+      () => diagnoseDocument(vscode, collection, document),
+      document.uri.toString(),
+      DEBOUNCE_MS,
+    );
+  }
+
+  // Scan already-open editors at activation.
+  for (const editor of vscode.window.visibleTextEditors) {
+    scheduleScan(editor.document);
+  }
+
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument(doc => scheduleScan(doc)),
+    vscode.workspace.onDidSaveTextDocument(doc => scheduleScan(doc)),
+    vscode.workspace.onDidCloseTextDocument(doc => {
+      _pending.delete(doc.uri.toString());
+      collection.delete(doc.uri);
+    }),
+  );
+
+  // Phase 1: skill install command
   const disposable = vscode.commands.registerCommand('impeccable.installSkill', async () => {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
@@ -669,7 +862,11 @@ function activate(context) {
   context.subscriptions.push(disposable);
 }
 
-function deactivate() {}
+function deactivate() {
+  // Clear all pending debounce timers on deactivation.
+  for (const timer of _pending.values()) clearTimeout(timer);
+  _pending.clear();
+}
 
 module.exports = { activate, deactivate, installSkill, mergeInstructions };
 `;
@@ -688,6 +885,33 @@ Design fluency for AI coding agents in VS Code.
 
 Impeccable bundles 23 design commands and a visual anti-pattern detector for
 GitHub Copilot Chat and other AI coding assistants.
+
+## Anti-pattern diagnostics
+
+The extension automatically detects visual anti-patterns in open HTML, CSS,
+JSX/TSX, Vue, Svelte, and Astro files and shows them as VS Code diagnostics.
+Diagnostics appear on document open and on save.
+
+### Configuration
+
+Add these to your VS Code settings (or workspace \`.vscode/settings.json\`):
+
+\`\`\`json
+{
+  // Disable the detector entirely (default: true)
+  "impeccable.detector.enable": false,
+
+  // Override severity per rule ID. Values: "error" | "warning" | "information" | "hint" | "off"
+  // "off" suppresses that rule without touching .impeccable/config.json.
+  "impeccable.detector.severity": {
+    "overused-font": "information",
+    "side-tab": "error"
+  }
+}
+\`\`\`
+
+Project-level ignores in \`.impeccable/config.json\` (set by the CLI) are also
+honored automatically — no extra configuration needed.
 
 ## Getting started
 
@@ -936,7 +1160,7 @@ async function build() {
   }
 
   // Assemble VS Code extension package from the generated skill files
-  buildVSCodeExtension(DIST_DIR, ROOT_DIR, skills, skillsVersion);
+  await buildVSCodeExtension(DIST_DIR, ROOT_DIR, skills, skillsVersion);
 
   // Assemble universal directory
   assembleUniversal(DIST_DIR);
