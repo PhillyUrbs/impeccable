@@ -23,6 +23,7 @@
         "ai": "^6.0.168",
         "archiver": "^8.0.0",
         "astro": "^7.0.0",
+        "esbuild": "^0.28.1",
         "fontkit": "^2.0.4",
         "modern-screenshot": "^4.7.0",
         "motion": "^12.38.0",

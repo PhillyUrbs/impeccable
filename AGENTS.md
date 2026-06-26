@@ -17,6 +17,8 @@
 - `bun run test:skill-behavior` - opt-in LLM-backed checks that the SKILL.md Setup flow actually drives the agent (~5 min; runs claude-sonnet-4-6 / gpt-5.5 / gemini-3.1-flash-lite, roughly $0.50-1.50 per run on the production-tier models, needs `.env` with provider keys).
 - `bun run build:browser` / `bun run build:extension` - rebuild browser-specific bundles.
 
+The VS Code extension build (`bun run build` / `bun run build:skills`) uses `esbuild` (devDependency) to bundle `cli/vscode-detector.mjs` and its dependencies into `dist/vscode/detector.js` as a self-contained CJS module. No separate step is needed — it runs as part of `buildVSCodeExtension()` inside `scripts/build.js`.
+
 Run `bun run build` after changing anything in `skill/`, transformer code, or user-facing counts. It validates the generated distribution under `dist/` without touching tracked root harness outputs. Use `bun run build:release` only when intentionally refreshing generated provider permutations for release/main-sync or build-system work.
 
 ## Generated Provider Output Policy
